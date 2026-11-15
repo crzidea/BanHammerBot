@@ -40,6 +40,24 @@ class DecisionTests(unittest.TestCase):
 
 
 class HTTPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_timed_restriction_never_retries_an_aging_deadline(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(503)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with self.assertRaises(APIError):
+                await Telegram(client, "token", 100).call(
+                    "restrictChatMember",
+                    chat_id=-1001,
+                    user_id=42,
+                    permissions={"can_send_messages": False},
+                    until_date=2000,
+                )
+        self.assertEqual(len(calls), 1)
+
     async def test_jev_multimodal_contract(self):
         captured = []
 
@@ -122,6 +140,107 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                 await Telegram(client, "secret-token", 100).call("getMe")
         self.assertNotIn("secret", str(caught.exception))
         self.assertEqual(len(calls), 1)
+
+    async def test_telegram_error_reports_method_chat_and_description(self):
+        for status in (200, 400):
+            with self.subTest(status=status):
+                async with httpx.AsyncClient(
+                    transport=httpx.MockTransport(
+                        lambda request, status=status: httpx.Response(
+                            status,
+                            json={
+                                "ok": False,
+                                "error_code": 400,
+                                "description": "Bad Request: chat not found",
+                            },
+                        )
+                    ),
+                ) as client:
+                    with self.assertRaises(APIError) as caught:
+                        await Telegram(client, "secret-token", 100).call("getChat", chat_id=-1001)
+                self.assertIn("telegram.getChat", str(caught.exception))
+                self.assertIn("chat_id=-1001", str(caught.exception))
+                self.assertIn("Bad Request: chat not found", str(caught.exception))
+
+    async def test_telegram_description_redacts_credentials_urls_and_log_injection(self):
+        token = "123:secret-token"
+        description = (
+            f"Bad Request: {token}, 123%3Asecret-token "
+            f"https://api.telegram.org/bot{token}/getMe Bearer secret-key\n\x1b[31mforged log"
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    400,
+                    json={"ok": False, "description": description, "extra": "raw-body-marker"},
+                )
+            )
+        ) as client:
+            with self.assertRaises(APIError) as caught:
+                await Telegram(client, token, 100).call("sendMessage", chat_id=-1, text="private")
+        error = str(caught.exception)
+        for sensitive in (
+            "secret-token",
+            "secret-key",
+            "https://",
+            "\n",
+            "\x1b",
+            "raw-body-marker",
+            "private",
+        ):
+            self.assertNotIn(sensitive, error)
+        self.assertIn("Bad Request", error)
+
+    async def test_telegram_migration_error_reports_new_group_id(self):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    400,
+                    json={
+                        "ok": False,
+                        "description": "Bad Request: group chat was upgraded",
+                        "parameters": {"migrate_to_chat_id": -100999},
+                    },
+                )
+            )
+        ) as client:
+            with self.assertRaises(APIError) as caught:
+                await Telegram(client, "secret-token", 100).call("getChat", chat_id=-123)
+        self.assertEqual(caught.exception.migrate_to_chat_id, -100999)
+        self.assertIn("TELEGRAM_CHAT_IDS", str(caught.exception))
+        self.assertIn("-100999", str(caught.exception))
+
+    async def test_malformed_telegram_error_metadata_is_not_logged(self):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    json={
+                        "ok": False,
+                        "error_code": "sensitive",
+                        "description": ["sensitive"],
+                        "parameters": {"migrate_to_chat_id": "sensitive"},
+                    },
+                )
+            )
+        ) as client:
+            with self.assertRaises(APIError) as caught:
+                await Telegram(client, "secret-token", 100).call("getChat", chat_id="sensitive")
+        self.assertNotIn("sensitive", str(caught.exception))
+        self.assertIn("telegram.getChat", str(caught.exception))
+
+    async def test_jev_error_does_not_log_provider_body(self):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    400,
+                    json={"description": "sensitive provider data"},
+                )
+            )
+        ) as client:
+            with self.assertRaises(APIError) as caught:
+                await JSONAPI(client, "jev").post("https://example.test", {})
+        self.assertNotIn("sensitive", str(caught.exception))
 
     async def test_timeouts_retry_boundedly_without_leaking_url(self):
         def handler(request):

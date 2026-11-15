@@ -13,7 +13,7 @@ DEFAULT_POLICY = (
 class Config:
     telegram_token: str = field(repr=False)
     typesafe_key: str = field(repr=False)
-    chat_ids: frozenset[int]
+    chat_ids: frozenset[int] = frozenset()
     model: str = "jev-1.14.0"
     api_url: str = "https://api.typesafe.ai/v1/systemone"
     dry_run: bool = True
@@ -32,8 +32,8 @@ class Config:
     def __post_init__(self) -> None:
         if not self.telegram_token or not self.typesafe_key:
             raise ValueError("Set TELEGRAM_BOT_TOKEN and TYPESAFE_API_KEY in .env")
-        if not self.chat_ids or any(i >= 0 for i in self.chat_ids):
-            raise ValueError("TELEGRAM_CHAT_IDS must contain negative group/supergroup IDs")
+        if any(i >= 0 for i in self.chat_ids):
+            raise ValueError("TELEGRAM_CHAT_IDS must be empty or contain negative group IDs")
         if any(i <= 0 for i in self.exempt_user_ids):
             raise ValueError("EXEMPT_USER_IDS must contain positive user IDs")
         if not 0 < self.review_threshold <= self.ban_threshold <= 1:

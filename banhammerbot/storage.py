@@ -1,10 +1,18 @@
 import json
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
 
+@dataclass(frozen=True)
+class GroupSettings:
+    dry_run: bool
+    join_mute_seconds: int = 0
+    join_mute_duration: int = 14400
+
+
 class Store:
-    """Persist only the polling cursor and moderation metadata, never message/image content."""
+    """Persist settings, group directory, selections, and audits; never message/image content."""
 
     def __init__(self, path: str):
         if path != ":memory:":
@@ -23,7 +31,120 @@ class Store:
                 decision TEXT,
                 detail TEXT
             );
+            CREATE TABLE IF NOT EXISTS groups (
+                chat_id INTEGER PRIMARY KEY, title TEXT NOT NULL, type TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS group_settings (
+                chat_id INTEGER PRIMARY KEY,
+                dry_run INTEGER CHECK(dry_run IN (0, 1)),
+                join_mute_seconds INTEGER NOT NULL DEFAULT 0
+                    CHECK(join_mute_seconds = 0 OR join_mute_seconds BETWEEN 60 AND 2592000),
+                join_mute_duration INTEGER NOT NULL DEFAULT 14400
+                    CHECK(join_mute_duration BETWEEN 60 AND 2592000)
+            );
+            CREATE TABLE IF NOT EXISTS selections (
+                user_id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS join_actions (
+                chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, joined_at INTEGER NOT NULL,
+                action TEXT NOT NULL, until_date INTEGER NOT NULL,
+                PRIMARY KEY(chat_id, user_id, joined_at)
+            );
+            INSERT OR IGNORE INTO groups (chat_id, title, type)
+                SELECT DISTINCT chat_id, CAST(chat_id AS TEXT), 'unknown' FROM audit;
         """)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(group_settings)")}
+        if "join_mute_duration" not in columns:
+            with self.db:
+                self.db.execute("BEGIN")
+                self.db.execute(
+                    "ALTER TABLE group_settings ADD COLUMN join_mute_duration INTEGER "
+                    "NOT NULL DEFAULT 14400 CHECK(join_mute_duration BETWEEN 60 AND 2592000)"
+                )
+                self.db.execute(
+                    "UPDATE group_settings SET join_mute_duration=join_mute_seconds "
+                    "WHERE join_mute_seconds > 0"
+                )
+
+    def remember_group(self, chat: dict) -> None:
+        if chat.get("type") not in {"group", "supergroup"}:
+            return
+        with self.db:
+            self.db.execute(
+                "INSERT INTO groups VALUES (?, ?, ?) ON CONFLICT(chat_id) DO UPDATE "
+                "SET title=excluded.title, type=excluded.type",
+                (chat["id"], chat.get("title", str(chat["id"]))[:256], chat["type"]),
+            )
+
+    def groups(self, offset: int = 0, limit: int = 10) -> list[int]:
+        return [
+            row[0]
+            for row in self.db.execute(
+                "SELECT chat_id FROM groups ORDER BY chat_id LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+        ]
+
+    def select_group(self, user_id: int, chat_id: int) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO selections VALUES (?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id",
+                (user_id, chat_id),
+            )
+
+    def selected_group(self, user_id: int) -> int | None:
+        row = self.db.execute(
+            "SELECT chat_id FROM selections WHERE user_id=?", (user_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def settings(self, chat_id: int, default_dry_run: bool) -> GroupSettings:
+        row = self.db.execute(
+            "SELECT dry_run, join_mute_seconds, join_mute_duration "
+            "FROM group_settings WHERE chat_id=?",
+            (chat_id,),
+        ).fetchone()
+        if row is None:
+            return GroupSettings(default_dry_run)
+        return GroupSettings(default_dry_run if row[0] is None else bool(row[0]), row[1], row[2])
+
+    def set_dry_run(self, chat_id: int, enabled: bool) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO group_settings (chat_id, dry_run) VALUES (?, ?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET dry_run=excluded.dry_run",
+                (chat_id, int(enabled)),
+            )
+
+    def set_join_mute(self, chat_id: int, seconds: int) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO group_settings (chat_id, join_mute_seconds, join_mute_duration) "
+                "VALUES (?, ?, ?) ON CONFLICT(chat_id) DO UPDATE "
+                "SET join_mute_seconds=excluded.join_mute_seconds, "
+                "join_mute_duration=CASE WHEN excluded.join_mute_seconds > 0 "
+                "THEN excluded.join_mute_seconds ELSE group_settings.join_mute_duration END",
+                (chat_id, seconds, seconds or 14400),
+            )
+
+    def join_handled(self, chat_id: int, user_id: int, joined_at: int) -> bool:
+        return (
+            self.db.execute(
+                "SELECT 1 FROM join_actions WHERE chat_id=? AND user_id=? AND joined_at=?",
+                (chat_id, user_id, joined_at),
+            ).fetchone()
+            is not None
+        )
+
+    def record_join(
+        self, chat_id: int, user_id: int, joined_at: int, action: str, until_date: int
+    ) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO join_actions VALUES (?, ?, ?, ?, ?)",
+                (chat_id, user_id, joined_at, action, until_date),
+            )
 
     def offset(self) -> int | None:
         row = self.db.execute("SELECT offset FROM cursor WHERE id=1").fetchone()

@@ -1,9 +1,11 @@
 services:
-  bot:
+  banhammerbot:
+    image: banhammerbot:latest
     build: .
     env_file: .env
+    init: true
     restart: unless-stopped
-    stop_grace_period: 2m
+    stop_grace_period: 10s
     volumes:
       - bot-data:/app/data
 

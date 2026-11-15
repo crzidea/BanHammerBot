@@ -6,10 +6,12 @@ from typing import Any
 from .api import APIError, ImageAsset, Telegram
 from .config import Config
 from .decision import InvalidDecision, Jev
+from .joins import JoinMute
+from .management import Management, format_duration
+from .permissions import ADMINS, can_manage, has_moderation_rights
 from .storage import Store
 
 log = logging.getLogger(__name__)
-ADMINS = {"creator", "administrator"}
 MEMBERS = {"member", "restricted", "left"}
 MEDIA_TYPES = ("photo", "document", "video", "animation", "sticker", "audio", "voice", "video_note")
 
@@ -64,15 +66,23 @@ def choose_photo(photos: list[dict]) -> str | None:
 
 
 class Moderator:
-    def __init__(self, config: Config, telegram: Telegram, jev: Jev, store: Store):
+    def __init__(self, config: Config, telegram: Telegram, jev: Jev, store: Store, *, bot_id: int):
         self.config = config
         self.telegram = telegram
         self.jev = jev
         self.store = store
+        self.bot_id = bot_id
         self.username = ""
         self.history: OrderedDict[tuple[int, int], list[tuple[float, dict]]] = OrderedDict()
         self.avatars: OrderedDict[int, tuple[float, ImageAsset | None]] = OrderedDict()
         self.jev_unavailable_until = 0.0
+        self.management = Management(config, telegram, store, bot_id)
+        self.joins = JoinMute(config, telegram, store, bot_id)
+
+    async def can_moderate(self, chat_id: int) -> bool:
+        # Check on every event: works for existing/new groups and immediately observes demotions.
+        member = await self.telegram.call("getChatMember", chat_id=chat_id, user_id=self.bot_id)
+        return has_moderation_rights(member)
 
     def recent(self, key: tuple[int, int], summary: dict, now: float) -> list[dict]:
         for existing_key, entries in list(self.history.items()):
@@ -130,23 +140,28 @@ class Moderator:
             status["message_image"] = "unsupported_media"
         return images, status
 
-    async def command(self, message: dict) -> bool:
+    async def command(self, message: dict, member: dict) -> bool:
         parts = message.get("text", "").split()
         if not parts:
             return False
         command, _, target = parts[0].partition("@")
         if target and target.lower() != self.username.lower():
             return False
-        if command not in {"/status", "/unban", "/help"}:
+        if command not in {"/status", "/unban", "/help", "/menu"}:
             return False
         chat_id = message["chat"]["id"]
+        settings = self.store.settings(chat_id, self.config.dry_run)
         if command == "/unban":
-            if len(parts) != 2 or not parts[1].isascii() or not parts[1].isdigit():
+            if not can_manage(member):
+                text = "You need Ban users admin permission to unban members."
+            elif len(parts) != 2 or not parts[1].isascii() or not parts[1].isdigit():
                 text = "Usage: /unban <numeric user ID>"
             elif int(parts[1]) <= 0:
                 text = "The user ID must be positive."
-            elif self.config.dry_run:
-                text = "Dry run: unban was not executed. Set DRY_RUN=false to enable changes."
+            elif settings.dry_run:
+                text = (
+                    "Dry run: unban was not executed. Select this group in DM and use /dryrun off."
+                )
             else:
                 await self.telegram.call(
                     "unbanChatMember",
@@ -157,12 +172,25 @@ class Moderator:
                 text = f"Unbanned user {parts[1]}. They may rejoin using an invite."
         else:
             text = (
-                f"BanHammerBot: {'dry run' if self.config.dry_run else 'live'}\n"
+                f"BanHammerBot: {'dry run' if settings.dry_run else 'live'}\n"
                 f"Jev: {self.config.model}\nBan threshold: {self.config.ban_threshold:.2f}\n"
+                f"New-member mute: {format_duration(settings.join_mute_seconds)}\n"
                 "Analyzes names, avatars, messages, and photos.\n"
-                "Admin commands: /status, /help, /unban <user ID>"
+                "Manage this group in the bot's private chat."
             )
-        await self.telegram.call("sendMessage", chat_id=chat_id, text=text)
+        params = {"chat_id": chat_id, "text": text}
+        if self.username:
+            params["reply_markup"] = {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "Manage in private chat",
+                            "url": f"https://t.me/{self.username}?start=group_{chat_id}",
+                        }
+                    ]
+                ]
+            }
+        await self.telegram.call("sendMessage", **params)
         return True
 
     def record(
@@ -192,15 +220,23 @@ class Moderator:
         )
 
     async def handle(self, update: dict) -> None:
+        self.management.config = self.config
+        self.management.username = self.username
+        self.joins.config = self.config
+        if await self.management.handle(update) or await self.joins.handle(update):
+            return
         update_id = update["update_id"]
         if self.store.completed(update_id):
             return
         message = update.get("message") or update.get("edited_message")
         if not message or message.get("chat", {}).get("type") not in {"group", "supergroup"}:
             return
+        self.store.remember_group(message["chat"])
         chat_id = message["chat"]["id"]
         user = message.get("from")
-        if chat_id not in self.config.chat_ids or not user or message.get("sender_chat"):
+        if self.config.chat_ids and chat_id not in self.config.chat_ids:
+            return
+        if not user or message.get("sender_chat"):
             return
         if user.get("is_bot"):
             return
@@ -214,9 +250,14 @@ class Moderator:
             return
         user_id = user["id"]
         try:
+            if not await self.can_moderate(chat_id):
+                self.record(
+                    update_id, message, "inactive", detail="bot_missing_moderation_permissions"
+                )
+                return
             member = await self.telegram.call("getChatMember", chat_id=chat_id, user_id=user_id)
             if member["status"] in ADMINS:
-                await self.command(message)
+                await self.command(message, member)
                 return
             if user_id in self.config.exempt_user_ids or member["status"] not in MEMBERS:
                 return
@@ -240,8 +281,11 @@ class Moderator:
                 action = "review" if decision.violation >= self.config.review_threshold else "allow"
                 self.record(update_id, message, action, decision)
                 return
-            if self.config.dry_run:
+            if self.store.settings(chat_id, self.config.dry_run).dry_run:
                 self.record(update_id, message, "would_ban", decision)
+                return
+            if not await self.can_moderate(chat_id):
+                self.record(update_id, message, "inactive", decision, "bot_permissions_changed")
                 return
             # A user may have become an administrator while the model was evaluating them.
             member = await self.telegram.call("getChatMember", chat_id=chat_id, user_id=user_id)
@@ -268,7 +312,7 @@ class Moderator:
             else:
                 self.record(update_id, message, "banned", decision)
         except APIError as exc:
-            if exc.retry_after and exc.code == 429 and str(exc).startswith("jev"):
+            if exc.retry_after and exc.code == 429 and exc.service == "jev":
                 self.jev_unavailable_until = time.monotonic() + exc.retry_after
             self.record(update_id, message, "error", detail=str(exc))
         except InvalidDecision:

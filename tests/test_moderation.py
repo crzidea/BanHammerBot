@@ -30,14 +30,24 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         self.config = Config("token", "key", frozenset({-1001}), dry_run=False)
         self.telegram = AsyncMock()
         self.members = ["member"]
+        self.bot_id = 9000
+        self.bot_member = {
+            "status": "administrator",
+            "can_restrict_members": True,
+            "can_delete_messages": True,
+        }
         self.delete_error = False
 
         async def call(method, **params):
             if method == "getChatMember":
+                if params["user_id"] == self.bot_id:
+                    return self.bot_member
                 status = self.members.pop(0) if len(self.members) > 1 else self.members[0]
-                return {"status": status}
+                return {"status": status, "can_restrict_members": True}
             if method == "getUserProfilePhotos":
                 return {"photos": [[{"file_id": "avatar", "width": 640, "height": 640}]]}
+            if method == "getChat":
+                return {"id": params["chat_id"], "type": "supergroup", "title": "Test group"}
             if method == "deleteMessage" and self.delete_error:
                 raise APIError("telegram", 400)
             return True
@@ -47,7 +57,7 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         self.jev = AsyncMock()
         self.jev.decide.return_value = Decision(0.99, 0.01, 0.9, "jev-1.14.0")
         self.store = Store(":memory:")
-        self.bot = Moderator(self.config, self.telegram, self.jev, self.store)
+        self.bot = Moderator(self.config, self.telegram, self.jev, self.store, bot_id=self.bot_id)
         self.bot.username = "banhammerbot"
 
     def tearDown(self):
@@ -74,7 +84,9 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(len(self.calls("deleteMessage")), 1)
-        self.assertEqual(len(self.calls("getChatMember")), 2)
+        checks = self.calls("getChatMember")
+        self.assertEqual(sum(c.kwargs["user_id"] == 42 for c in checks), 2)
+        self.assertEqual(sum(c.kwargs["user_id"] == self.bot_id for c in checks), 2)
         evidence, images = self.jev.decide.call_args.args
         self.assertEqual(evidence["sender"]["username"], "buy_deals")
         self.assertIn("sender_avatar", images)
@@ -84,6 +96,115 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.handle(update())
         self.assertEqual(self.action(), "would_ban")
         self.assertFalse(self.calls("banChatMember") + self.calls("deleteMessage"))
+
+    async def test_per_group_dry_run_overrides_global_default(self):
+        self.store.set_dry_run(-1001, True)
+        await self.bot.handle(update())
+        self.assertEqual(self.action(), "would_ban")
+        self.bot.config = replace(self.config, dry_run=True)
+        self.store.set_dry_run(-1001, False)
+        await self.bot.handle(update(2))
+        self.assertEqual(self.action(2), "banned")
+
+    async def test_private_management_never_reaches_jev(self):
+        self.members = ["administrator"]
+        await self.bot.handle(
+            {
+                "update_id": 1,
+                "message": {
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 42},
+                    "text": "/select -1001",
+                    "message_id": 1,
+                },
+            }
+        )
+        self.assertEqual(self.store.selected_group(42), -1001)
+        self.jev.decide.assert_not_awaited()
+
+    async def test_limited_group_admin_cannot_unban(self):
+        original = self.telegram.call.side_effect
+
+        async def call(method, **params):
+            if method == "getChatMember" and params["user_id"] == 42:
+                return {"status": "administrator", "can_restrict_members": False}
+            return await original(method, **params)
+
+        self.telegram.call.side_effect = call
+        await self.bot.handle(update(text="/unban 123"))
+        self.assertFalse(self.calls("unbanChatMember"))
+        self.jev.decide.assert_not_awaited()
+
+    async def test_all_groups_mode_moderates_new_groups_without_reconfiguration(self):
+        self.bot.config = replace(self.config, chat_ids=frozenset())
+        for number, chat_id, chat_type in ((1, -1001, "supergroup"), (2, -999, "group")):
+            await self.bot.handle(update(number, chat={"id": chat_id, "type": chat_type}))
+            self.assertEqual(self.action(number), "banned")
+        self.assertEqual([c.kwargs["chat_id"] for c in self.calls("banChatMember")], [-1001, -999])
+
+    async def test_all_groups_mode_still_ignores_private_chats_and_channels(self):
+        self.bot.config = replace(self.config, chat_ids=frozenset())
+        for number, chat_type in enumerate(("private", "channel"), start=1):
+            await self.bot.handle(update(number, chat={"id": -999, "type": chat_type}))
+        self.telegram.call.assert_not_awaited()
+        self.jev.decide.assert_not_awaited()
+
+    async def test_missing_bot_permissions_prevents_analysis_and_actions(self):
+        self.bot.config = replace(self.config, chat_ids=frozenset())
+        for number, member in enumerate(
+            (
+                {"status": "member"},
+                {"status": "left"},
+                {"status": "kicked"},
+                {
+                    "status": "administrator",
+                    "can_restrict_members": False,
+                    "can_delete_messages": True,
+                },
+                {
+                    "status": "administrator",
+                    "can_restrict_members": True,
+                    "can_delete_messages": False,
+                },
+                {"status": "administrator"},
+            ),
+            start=1,
+        ):
+            self.bot_member = member
+            await self.bot.handle(update(number))
+            self.assertEqual(self.action(number), "inactive")
+        self.jev.decide.assert_not_awaited()
+        self.assertFalse(self.calls("getUserProfilePhotos") + self.calls("banChatMember"))
+
+    async def test_bot_permissions_rechecked_after_promotion_and_demotion(self):
+        self.bot.config = replace(self.config, chat_ids=frozenset())
+        self.jev.decide.return_value = Decision(0, 0, 0, "jev")
+        admin = self.bot_member
+        self.bot_member = {"status": "member"}
+        await self.bot.handle(update(1))
+        self.bot_member = admin
+        await self.bot.handle(update(2))
+        self.bot_member = {"status": "member"}
+        await self.bot.handle(update(3))
+        self.assertEqual([self.action(i) for i in (1, 2, 3)], ["inactive", "allow", "inactive"])
+        self.assertEqual(self.jev.decide.await_count, 1)
+
+    async def test_bot_permissions_lost_during_decision_prevents_ban(self):
+        async def decide(*args):
+            self.bot_member["can_restrict_members"] = False
+            return Decision(1, 1, 1, "jev")
+
+        self.jev.decide.side_effect = decide
+        await self.bot.handle(update())
+        self.assertEqual(self.action(), "inactive")
+        self.assertFalse(self.calls("banChatMember") + self.calls("deleteMessage"))
+
+    async def test_history_is_isolated_between_groups_in_all_groups_mode(self):
+        self.bot.config = replace(self.config, chat_ids=frozenset())
+        self.jev.decide.return_value = Decision(0, 0, 0, "jev")
+        await self.bot.handle(update(1, "hello"))
+        await self.bot.handle(update(2, "another group", chat={"id": -1002, "type": "supergroup"}))
+        self.assertEqual(self.jev.decide.call_args.args[0]["recent_messages_by_same_sender"], [])
 
     async def test_allow_review_and_profile_only(self):
         for number, decision, action in (
