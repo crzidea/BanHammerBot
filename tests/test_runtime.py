@@ -25,10 +25,15 @@ class ConfigTests(unittest.TestCase):
         for changes in (
             {"chat_ids": frozenset({123})},
             {"ban_threshold": float("nan")},
+            {"ban_threshold": float("inf")},
             {"ban_threshold": 1.1},
-            {"review_threshold": 0.9, "ban_threshold": 0.8},
+            {"ban_threshold": 0},
+            {"ban_threshold": -0.1},
             {"api_timeout": float("inf")},
             {"max_event_age": 0},
+            {"bio_cache_seconds": 0},
+            {"bio_cache_seconds": -1},
+            {"bio_cache_seconds": float("inf")},
             {"api_url": "http://example.com"},
             {"api_url": "https://user:pass@example.com"},
             {"history_limit": 1000},
@@ -47,6 +52,9 @@ class ConfigTests(unittest.TestCase):
             config = Config.from_env()
             self.assertTrue(config.dry_run)
             self.assertEqual(config.chat_ids, frozenset({-1001, -2}))
+            self.assertEqual(config.bio_cache_seconds, 300)
+        with patch.dict(os.environ, {**env, "BIO_CACHE_SECONDS": "60"}, clear=True):
+            self.assertEqual(Config.from_env().bio_cache_seconds, 60)
         with patch.dict(os.environ, {**env, "DRY_RUN": "flase"}, clear=True):
             with self.assertRaises(ValueError):
                 Config.from_env()
@@ -57,6 +65,16 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(settings=settings), patch.dict(os.environ, settings, clear=True):
                 self.assertEqual(Config.from_env().chat_ids, frozenset())
         self.assertEqual(Config("token", "key").chat_ids, frozenset())
+
+    def test_ban_threshold_is_independent_of_obsolete_review_setting(self):
+        env = {
+            "TELEGRAM_BOT_TOKEN": "token",
+            "TYPESAFE_API_KEY": "key",
+            "BAN_THRESHOLD": "0.5",
+            "REVIEW_THRESHOLD": "unused",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(Config.from_env().ban_threshold, 0.5)
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):

@@ -1,8 +1,9 @@
+import asyncio
 import copy
 import time
 import unittest
 from dataclasses import replace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from banhammerbot.api import APIError, ImageAsset
 from banhammerbot.config import Config
@@ -37,6 +38,7 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
             "can_delete_messages": True,
         }
         self.delete_error = False
+        self.user_chat = {"id": 42, "type": "private", "bio": "Discount tokens at spam.example"}
 
         async def call(method, **params):
             if method == "getChatMember":
@@ -47,6 +49,10 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
             if method == "getUserProfilePhotos":
                 return {"photos": [[{"file_id": "avatar", "width": 640, "height": 640}]]}
             if method == "getChat":
+                if params["chat_id"] > 0:
+                    if isinstance(self.user_chat, Exception):
+                        raise self.user_chat
+                    return self.user_chat
                 return {"id": params["chat_id"], "type": "supergroup", "title": "Test group"}
             if method == "deleteMessage" and self.delete_error:
                 raise APIError("telegram", 400)
@@ -89,6 +95,7 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(c.kwargs["user_id"] == self.bot_id for c in checks), 2)
         evidence, images = self.jev.decide.call_args.args
         self.assertEqual(evidence["sender"]["username"], "buy_deals")
+        self.assertEqual(evidence["sender"]["bio"], self.user_chat["bio"])
         self.assertIn("sender_avatar", images)
 
     async def test_dry_run_never_bans_or_deletes(self):
@@ -121,6 +128,47 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.store.selected_group(42), -1001)
         self.jev.decide.assert_not_awaited()
+
+    async def test_group_banlog_opens_private_view_without_exposing_entries(self):
+        await self.bot.handle(update())
+        self.members = ["administrator"]
+        self.telegram.call.reset_mock()
+        self.jev.decide.reset_mock()
+        await self.bot.handle(update(2, text="/banlog@BanHammerBot"))
+        sent = self.calls("sendMessage")[0].kwargs
+        self.assertEqual(sent["chat_id"], -1001)
+        self.assertNotIn("Violation:", sent["text"])
+        self.assertEqual(
+            sent["reply_markup"]["inline_keyboard"][0][0]["url"],
+            "https://t.me/banhammerbot?start=banlog_-1001",
+        )
+        self.jev.decide.assert_not_awaited()
+        self.assertFalse(self.calls("banChatMember") + self.calls("deleteMessage"))
+
+    async def test_dry_run_decision_can_be_queried_by_admin_without_enforcement(self):
+        self.bot.config = replace(self.config, dry_run=True)
+        await self.bot.handle(update())
+        self.assertEqual(self.action(), "would_ban")
+        self.members = ["administrator"]
+        self.jev.decide.reset_mock()
+        await self.bot.handle(
+            {
+                "update_id": 2,
+                "message": {
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 42},
+                    "text": "/start banlog_-1001",
+                    "message_id": 2,
+                },
+            }
+        )
+        sent = self.calls("sendMessage")[-1].kwargs
+        self.assertEqual(sent["chat_id"], 42)
+        self.assertIn("Dry run: would ban (no action)", sent["text"])
+        self.assertIn("Violation: 0.99", sent["text"])
+        self.assertIn('href="tg://user?id=42"', sent["text"])
+        self.jev.decide.assert_not_awaited()
+        self.assertFalse(self.calls("banChatMember") + self.calls("deleteMessage"))
 
     async def test_limited_group_admin_cannot_unban(self):
         original = self.telegram.call.side_effect
@@ -174,7 +222,9 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.handle(update(number))
             self.assertEqual(self.action(number), "inactive")
         self.jev.decide.assert_not_awaited()
-        self.assertFalse(self.calls("getUserProfilePhotos") + self.calls("banChatMember"))
+        self.assertFalse(
+            self.calls("getUserProfilePhotos") + self.calls("getChat") + self.calls("banChatMember")
+        )
 
     async def test_bot_permissions_rechecked_after_promotion_and_demotion(self):
         self.bot.config = replace(self.config, chat_ids=frozenset())
@@ -206,16 +256,22 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.handle(update(2, "another group", chat={"id": -1002, "type": "supergroup"}))
         self.assertEqual(self.jev.decide.call_args.args[0]["recent_messages_by_same_sender"], [])
 
-    async def test_allow_review_and_profile_only(self):
+    async def test_ban_threshold_and_profile_only(self):
         for number, decision, action in (
             (1, Decision(0.01, 0.01, 1, "jev"), "allow"),
-            (2, Decision(0.8, 0.01, 1, "jev"), "review"),
-            (3, Decision(0.01, 0.98, 0, "jev"), "banned"),
+            (2, Decision(0.70, 0.01, 1, "jev"), "allow"),
+            (3, Decision(0.8, 0.01, 1, "jev"), "allow"),
+            (4, Decision(0.01, 0.979, 1, "jev"), "allow"),
+            (5, Decision(0.01, 0.98, 0, "jev"), "banned"),
+            (6, Decision(0.98, 0.01, 0, "jev"), "banned"),
         ):
-            self.jev.decide.return_value = decision
-            await self.bot.handle(update(number))
-            self.assertEqual(self.action(number), action)
-        self.assertEqual(len(self.calls("banChatMember")), 1)
+            with self.subTest(decision=decision):
+                self.telegram.call.reset_mock()
+                self.jev.decide.return_value = decision
+                await self.bot.handle(update(number))
+                self.assertEqual(self.action(number), action)
+                self.assertEqual(len(self.calls("banChatMember")), int(action == "banned"))
+                self.assertEqual(len(self.calls("deleteMessage")), int(action == "banned"))
 
     async def test_protected_users_and_chats_are_not_analyzed(self):
         items = [update(1, sender_chat={"id": -1002}), update(2), update(3), update(4)]
@@ -234,6 +290,7 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         self.bot.config = replace(self.config, exempt_user_ids=frozenset({42}))
         await self.bot.handle(update(2))
         self.jev.decide.assert_not_awaited()
+        self.assertFalse(self.calls("getChat"))
 
     async def test_admin_promoted_during_decision_not_banned(self):
         self.members = ["member", "administrator"]
@@ -322,6 +379,118 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         for user_id in range(300):
             self.bot.recent((-1001, user_id), summary, 1000)
         self.assertEqual(len(self.bot.history), 256)
+
+    async def test_bio_is_cached_and_refreshed_after_expiration(self):
+        self.bot.config = replace(self.config, bio_cache_seconds=60)
+        self.jev.decide.return_value = Decision(0, 0, 0, "jev")
+        with patch("banhammerbot.moderation.time", wraps=time) as clock:
+            clock.monotonic.return_value = 100
+            await self.bot.handle(update())
+            self.assertEqual(
+                self.jev.decide.call_args.args[0]["sender"]["bio"], self.user_chat["bio"]
+            )
+            self.user_chat["bio"] = "Updated bio"
+            clock.monotonic.return_value = 159
+            await self.bot.handle(update(2))
+            self.assertNotEqual(self.jev.decide.call_args.args[0]["sender"]["bio"], "Updated bio")
+            self.assertEqual(len(self.calls("getChat")), 1)
+            clock.monotonic.return_value = 160
+            await self.bot.handle(update(3))
+            self.assertEqual(self.jev.decide.call_args.args[0]["sender"]["bio"], "Updated bio")
+        self.assertEqual([c.kwargs for c in self.calls("getChat")], [{"chat_id": 42}] * 2)
+
+    async def test_unavailable_bio_is_omitted_and_cached_without_stopping_moderation(self):
+        self.jev.decide.return_value = Decision(0, 0, 0, "jev")
+        for index, result in enumerate(
+            (
+                {},
+                {"bio": ""},
+                {"bio": "  \n"},
+                {"bio": None},
+                {"bio": 123},
+                None,
+                [],
+                APIError("telegram", 400),
+                APIError("telegram", 403),
+                APIError("telegram", 429, 60),
+                APIError("telegram", 503),
+            )
+        ):
+            with self.subTest(result=result):
+                self.user_chat = result
+                self.bot.bios.clear()
+                self.telegram.call.reset_mock()
+                for number in (index * 2 + 1, index * 2 + 2):
+                    await self.bot.handle(update(number))
+                    self.assertNotIn("bio", self.jev.decide.call_args.args[0]["sender"])
+                    self.assertEqual(self.action(number), "allow")
+                self.assertEqual(len(self.calls("getChat")), 1)
+
+    async def test_unavailable_bio_is_retried_after_expiration(self):
+        with patch("banhammerbot.moderation.time", wraps=time) as clock:
+            clock.monotonic.return_value = 100
+            self.user_chat = APIError("telegram", 400)
+            self.assertIsNone(await self.bot.bio(42))
+            self.user_chat = {"bio": "Now visible"}
+            self.assertIsNone(await self.bot.bio(42))
+            clock.monotonic.return_value += self.config.bio_cache_seconds
+            self.assertEqual(await self.bot.bio(42), "Now visible")
+        self.assertEqual(len(self.calls("getChat")), 2)
+
+    async def test_bio_cache_is_isolated_by_user_and_bounded(self):
+        self.assertEqual(await self.bot.bio(42), self.user_chat["bio"])
+        self.user_chat = {"bio": "Another user's bio"}
+        self.assertEqual(await self.bot.bio(43), "Another user's bio")
+        self.assertNotEqual(await self.bot.bio(42), "Another user's bio")
+        for user_id in range(100, 355):
+            await self.bot.bio(user_id)
+        self.assertEqual(len(self.bot.bios), 256)
+        self.assertIn(42, self.bot.bios)
+        self.assertNotIn(43, self.bot.bios)
+
+    async def test_bio_content_is_bounded_and_not_persisted_or_logged(self):
+        self.user_chat["bio"] = "PRIVATE BIO " * 200
+        with self.assertLogs("banhammerbot.moderation", level="INFO") as logs:
+            await self.bot.handle(update())
+        self.assertLessEqual(len(self.jev.decide.call_args.args[0]["sender"]["bio"]), 1024)
+        self.assertNotIn("PRIVATE BIO", "\n".join(self.store.db.iterdump()))
+        self.assertNotIn("PRIVATE BIO", "\n".join(logs.output))
+
+    async def test_slow_bio_lookup_is_skipped_and_cached(self):
+        original = self.telegram.call.side_effect
+
+        async def call(method, **params):
+            if method == "getChat":
+                await asyncio.Future()
+            return await original(method, **params)
+
+        self.telegram.call.side_effect = call
+        with patch("banhammerbot.moderation.BIO_LOOKUP_TIMEOUT", 0.01):
+            await self.bot.handle(update())
+            await self.bot.handle(update(2))
+        self.assertNotIn("bio", self.jev.decide.call_args.args[0]["sender"])
+        self.assertEqual(self.jev.decide.await_count, 2)
+        self.assertEqual(len(self.calls("getChat")), 1)
+
+    async def test_bio_lookup_preserves_shutdown_cancellation(self):
+        started = asyncio.Event()
+        original = self.telegram.call.side_effect
+
+        async def call(method, **params):
+            if method == "getChat":
+                started.set()
+                await asyncio.Future()
+            return await original(method, **params)
+
+        self.telegram.call.side_effect = call
+        task = asyncio.create_task(self.bot.handle(update()))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.jev.decide.assert_not_awaited()
+        self.assertNotIn(42, self.bot.bios)
+        self.assertIsNone(self.action())
 
     async def test_avatar_is_cached_and_message_photo_is_included(self):
         self.jev.decide.return_value = Decision(0, 0, 0, "jev")

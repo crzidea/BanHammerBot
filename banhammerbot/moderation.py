@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from collections import OrderedDict
@@ -14,6 +15,7 @@ from .storage import Store
 log = logging.getLogger(__name__)
 MEMBERS = {"member", "restricted", "left"}
 MEDIA_TYPES = ("photo", "document", "video", "animation", "sticker", "audio", "voice", "video_note")
+BIO_LOOKUP_TIMEOUT = 3
 
 
 def message_summary(message: dict) -> dict:
@@ -75,6 +77,7 @@ class Moderator:
         self.username = ""
         self.history: OrderedDict[tuple[int, int], list[tuple[float, dict]]] = OrderedDict()
         self.avatars: OrderedDict[int, tuple[float, ImageAsset | None]] = OrderedDict()
+        self.bios: OrderedDict[int, tuple[float, str | None]] = OrderedDict()
         self.jev_unavailable_until = 0.0
         self.management = Management(config, telegram, store, bot_id)
         self.joins = JoinMute(config, telegram, store, bot_id)
@@ -116,6 +119,30 @@ class Moderator:
             self.avatars.popitem(last=False)
         return asset
 
+    async def bio(self, user_id: int) -> str | None:
+        now = time.monotonic()
+        for key, (deadline, _) in list(self.bios.items()):
+            if deadline <= now:
+                del self.bios[key]
+        if user_id in self.bios:
+            self.bios.move_to_end(user_id)
+            return self.bios[user_id][1]
+        bio = None
+        try:
+            # Optional context must not hold up moderation through lengthy API retries.
+            async with asyncio.timeout(BIO_LOOKUP_TIMEOUT):
+                chat = await self.telegram.call("getChat", chat_id=user_id)
+            value = chat.get("bio") if isinstance(chat, dict) else None
+            if isinstance(value, str):
+                bio = value[:1024].strip() or None
+        except (APIError, TimeoutError):
+            pass
+        # Cache unavailable results too, since many users' private chats are inaccessible.
+        self.bios[user_id] = (time.monotonic() + self.config.bio_cache_seconds, bio)
+        while len(self.bios) > 256:
+            self.bios.popitem(last=False)
+        return bio
+
     async def images(self, message: dict) -> tuple[dict[str, ImageAsset], dict[str, str]]:
         images = {}
         status = {}
@@ -147,11 +174,15 @@ class Moderator:
         command, _, target = parts[0].partition("@")
         if target and target.lower() != self.username.lower():
             return False
-        if command not in {"/status", "/unban", "/help", "/menu"}:
+        if command not in {"/status", "/unban", "/help", "/menu", "/banlog"}:
             return False
         chat_id = message["chat"]["id"]
         settings = self.store.settings(chat_id, self.config.dry_run)
-        if command == "/unban":
+        if command == "/banlog":
+            text = "View recent bans and dry-run ban decisions in the bot's private chat."
+            if not self.username:
+                text += " Send /select followed by this group's ID, then /banlog."
+        elif command == "/unban":
             if not can_manage(member):
                 text = "You need Ban users admin permission to unban members."
             elif len(parts) != 2 or not parts[1].isascii() or not parts[1].isdigit():
@@ -175,7 +206,7 @@ class Moderator:
                 f"BanHammerBot: {'dry run' if settings.dry_run else 'live'}\n"
                 f"Jev: {self.config.model}\nBan threshold: {self.config.ban_threshold:.2f}\n"
                 f"New-member mute: {format_duration(settings.join_mute_seconds)}\n"
-                "Analyzes names, avatars, messages, and photos.\n"
+                "Analyzes names, available bios, avatars, messages, and photos.\n"
                 "Manage this group in the bot's private chat."
             )
         params = {"chat_id": chat_id, "text": text}
@@ -184,8 +215,11 @@ class Moderator:
                 "inline_keyboard": [
                     [
                         {
-                            "text": "Manage in private chat",
-                            "url": f"https://t.me/{self.username}?start=group_{chat_id}",
+                            "text": "Recent ban log"
+                            if command == "/banlog"
+                            else "Manage in private chat",
+                            "url": f"https://t.me/{self.username}?start="
+                            f"{'banlog' if command == '/banlog' else 'group'}_{chat_id}",
                         }
                     ]
                 ]
@@ -276,10 +310,12 @@ class Moderator:
                 "recent_messages_by_same_sender": previous,
                 "image_status": image_status,
             }
+            bio = await self.bio(user_id)
+            if bio is not None:
+                evidence["sender"]["bio"] = bio
             decision = await self.jev.decide(evidence, images)
             if decision.violation < self.config.ban_threshold:
-                action = "review" if decision.violation >= self.config.review_threshold else "allow"
-                self.record(update_id, message, action, decision)
+                self.record(update_id, message, "allow", decision)
                 return
             if self.store.settings(chat_id, self.config.dry_run).dry_run:
                 self.record(update_id, message, "would_ban", decision)

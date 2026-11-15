@@ -1,5 +1,7 @@
+import asyncio
 import logging
 import re
+from html import escape
 
 from .api import APIError, Telegram
 from .config import Config
@@ -8,12 +10,15 @@ from .storage import Store
 
 log = logging.getLogger(__name__)
 JOIN_MUTE_PRESETS = (4 * 3600, 12 * 3600, 24 * 3600)
+BAN_LOG_PAGE_SIZE = 5
+BAN_LOG_NAME_TIMEOUT = 3
 PRIVATE_COMMANDS = [
     ("start", "Open the management menu"),
     ("menu", "Manage your selected group"),
     ("groups", "List groups you can manage"),
     ("select", "Select a group: /select or /select -100…"),
     ("status", "Show the selected group's settings"),
+    ("banlog", "Show recent bans and dry-run ban decisions"),
     ("dryrun", "Set selected group dry run: on or off"),
     ("joinmute", "Mute new members: on, off, 4h, 12h, or 24h"),
     ("unban", "Unban a user in the selected group"),
@@ -22,7 +27,9 @@ PRIVATE_COMMANDS = [
 HELP = (
     "Manage a group where you are the owner or an admin with Ban users permission.\n\n"
     "/select — choose a group\n/select -100… — select by numeric group ID\n"
-    "/menu or /status — current settings\n/dryrun on — observe without enforcement\n"
+    "/menu or /status — current settings\n"
+    "/banlog — recent bans and dry-run ban decisions\n"
+    "/dryrun on — observe without enforcement\n"
     "/dryrun off — enable enforcement for this group\n"
     "/joinmute 4h — mute new members for 4 hours\n"
     "/joinmute 12h or /joinmute 24h — longer mute durations\n"
@@ -81,7 +88,7 @@ class Management:
             commands=[
                 {"command": command, "description": description}
                 for command, description in PRIVATE_COMMANDS
-                if command in {"menu", "status", "unban", "help"}
+                if command in {"menu", "status", "banlog", "unban", "help"}
             ],
         )
         await self.telegram.call("setChatMenuButton", menu_button={"type": "commands"})
@@ -112,8 +119,13 @@ class Management:
         text: str,
         rows: list | None = None,
         message_id: int | None = None,
+        *,
+        parse_mode: str | None = None,
     ) -> None:
         params = {"chat_id": user_id, "text": text}
+        if parse_mode is not None:
+            params["parse_mode"] = parse_mode
+            params["link_preview_options"] = {"is_disabled": True}
         if rows is not None:
             params["reply_markup"] = {"inline_keyboard": rows}
         if message_id is not None:
@@ -223,6 +235,7 @@ class Management:
                     ],
                 ]
             )
+        rows.append([{"text": "Recent ban log", "callback_data": f"banlog:{chat_id}:0"}])
         rows.append(
             [
                 {"text": "Change group", "callback_data": "groups:0"},
@@ -230,6 +243,90 @@ class Management:
             ]
         )
         await self.send(user_id, text, rows, message_id)
+
+    async def ban_log_user_name(self, chat_id: int, user_id: int) -> str:
+        try:
+            # Names are optional: a slow lookup must not delay the log or moderation indefinitely.
+            async with asyncio.timeout(BAN_LOG_NAME_TIMEOUT):
+                member = await self.telegram.call("getChatMember", chat_id=chat_id, user_id=user_id)
+        except (APIError, TimeoutError):
+            return str(user_id)
+        user = member.get("user", {})
+        if user.get("id") != user_id:
+            return str(user_id)
+        parts = [user.get(key) for key in ("first_name", "last_name")]
+        name = " ".join(part for part in parts if isinstance(part, str))
+        return " ".join(name.split())[:128] or str(user_id)
+
+    async def ban_log(
+        self,
+        user_id: int,
+        chat: dict,
+        offset: int = 0,
+        message_id: int | None = None,
+    ) -> None:
+        chat_id = chat["id"]
+        entries = self.store.recent_bans(chat_id, offset, BAN_LOG_PAGE_SIZE + 1)
+        user_ids = list(dict.fromkeys(entry.user_id for entry in entries[:BAN_LOG_PAGE_SIZE]))
+        # Resolve each visible user once, concurrently, without persisting their profile data.
+        names = await asyncio.gather(
+            *(self.ban_log_user_name(chat_id, target_id) for target_id in user_ids)
+        )
+        user_names = dict(zip(user_ids, names, strict=True))
+        sections = [
+            f"<b>{escape(str(chat.get('title', chat_id)))}</b>\n"
+            "Recent ban log · times in UTC\n"
+            "Bans and dry-run decisions recorded by this bot."
+        ]
+        for entry in entries[:BAN_LOG_PAGE_SIZE]:
+            outcome = "Banned" if entry.action == "banned" else "Dry run: would ban (no action)"
+            text = (
+                f"<b>{outcome}</b> · {escape(entry.created_at)} UTC\n"
+                f'User: <a href="tg://user?id={entry.user_id}">'
+                f"{escape(user_names[entry.user_id])}</a>\n"
+            )
+            message = str(entry.message_id)
+            if chat["type"] == "supergroup" and str(chat_id).startswith("-100"):
+                channel_id = str(chat_id)[4:]
+                message = f'<a href="https://t.me/c/{channel_id}/{entry.message_id}">{message}</a>'
+            text += f"Message: {message}"
+            scores = [(entry.decision or {}).get(key) for key in ("unsolicited_ad", "spam")]
+            if all(type(score) in (float, int) and 0 <= score <= 1 for score in scores):
+                text += f" · Violation: {max(scores):.2f}"
+            sections.append(text)
+        if not entries:
+            sections.append(
+                "No older entries."
+                if offset
+                else "No bans or dry-run ban decisions recorded for this group yet."
+            )
+        else:
+            sections.append(
+                "Message links may be unavailable after deletion. "
+                "User links depend on Telegram privacy settings."
+            )
+        rows = []
+        navigation = []
+        if offset:
+            navigation.append(
+                {
+                    "text": "Newer",
+                    "callback_data": f"banlog:{chat_id}:{max(0, offset - BAN_LOG_PAGE_SIZE)}",
+                }
+            )
+        if len(entries) > BAN_LOG_PAGE_SIZE:
+            navigation.append(
+                {"text": "Older", "callback_data": f"banlog:{chat_id}:{offset + BAN_LOG_PAGE_SIZE}"}
+            )
+        if navigation:
+            rows.append(navigation)
+        rows.append(
+            [
+                {"text": "Back to menu", "callback_data": f"menu:{chat_id}"},
+                {"text": "Refresh", "callback_data": f"banlog:{chat_id}:0"},
+            ]
+        )
+        await self.send(user_id, "\n\n".join(sections), rows, message_id, parse_mode="HTML")
 
     async def selected(self, user_id: int) -> dict:
         chat_id = self.store.selected_group(user_id)
@@ -252,6 +349,11 @@ class Management:
         args = parts[1:]
         if name == "/start" and args and re.fullmatch(r"group_-[0-9]{1,16}", args[0]):
             name, args = "/select", [args[0].removeprefix("group_")]
+        if name == "/start" and len(args) == 1 and re.fullmatch(r"banlog_-[0-9]{1,16}", args[0]):
+            chat = await self.authorize(user_id, int(args[0].removeprefix("banlog_")))
+            self.store.select_group(user_id, chat["id"])
+            await self.ban_log(user_id, chat)
+            return
         if name in {"/groups", "/select"} and not args:
             await self.groups(user_id)
         elif name == "/select":
@@ -267,6 +369,10 @@ class Management:
                 await self.groups(user_id)
             else:
                 await self.panel(user_id, await self.selected(user_id))
+        elif name == "/banlog":
+            if args:
+                raise ManagementError("Use /banlog, then Older or Newer to browse entries.")
+            await self.ban_log(user_id, await self.selected(user_id))
         elif name == "/dryrun":
             chat = await self.selected(user_id)
             if args:
@@ -309,6 +415,13 @@ class Management:
             return
         if re.fullmatch(r"groups:[0-9]{1,6}", data):
             await self.groups(user_id, int(data.split(":")[1]), message_id)
+            return
+        match = re.fullmatch(r"banlog:(-[0-9]{1,16}):([0-9]{1,8})", data)
+        if match:
+            chat_id, offset = map(int, match.groups())
+            chat = await self.authorize(user_id, chat_id)
+            self.store.select_group(user_id, chat_id)
+            await self.ban_log(user_id, chat, offset, message_id)
             return
         match = re.fullmatch(r"(select|menu|dry|join|mute):(-[0-9]{1,16})(?::([0-9]{1,8}))?", data)
         if not match:

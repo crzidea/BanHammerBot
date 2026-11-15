@@ -1,9 +1,10 @@
+import asyncio
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from dataclasses import replace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from banhammerbot.api import APIError
 from banhammerbot.config import Config
@@ -184,10 +185,11 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         commands = self.calls("setMyCommands")
         self.assertEqual(commands[0].kwargs["scope"], {"type": "all_private_chats"})
         self.assertTrue(
-            {"select", "dryrun", "joinmute", "menu"}
+            {"select", "dryrun", "joinmute", "menu", "banlog"}
             <= {command["command"] for command in commands[0].kwargs["commands"]}
         )
         self.assertEqual(commands[1].kwargs["scope"], {"type": "all_chat_administrators"})
+        self.assertIn("banlog", {command["command"] for command in commands[1].kwargs["commands"]})
         self.assertEqual(
             self.calls("setChatMenuButton")[0].kwargs["menu_button"], {"type": "commands"}
         )
@@ -373,6 +375,264 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
             self.calls("unbanChatMember")[0].kwargs,
             {"chat_id": -1001, "user_id": 123, "only_if_banned": True},
         )
+
+    def record_ban(self, number=1, chat_id=-1001, action="banned", decision=None):
+        self.store.record(
+            number,
+            {
+                "chat": {"id": chat_id},
+                "from": {"id": 8745238344},
+                "message_id": 26699 + number,
+                "text": "private message content",
+            },
+            action,
+            decision,
+        )
+
+    async def test_banlog_shows_bans_and_dry_runs_in_either_mode(self):
+        self.roles[(-1001, 8745238344)] = {
+            "status": "kicked",
+            "user": {"id": 8745238344, "first_name": "测试用户", "last_name": "<b>& Name"},
+        }
+        self.record_ban(1, action="banned", decision={"unsolicited_ad": 0.99, "spam": 0.01})
+        self.record_ban(2, action="would_ban", decision={"unsolicited_ad": 0.02, "spam": 0.87})
+        self.record_ban(3, action="allow")
+        self.record_ban(4, chat_id=-1002)
+        await self.select()
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                self.store.set_dry_run(-1001, dry_run)
+                await self.manager.handle(dm("/banlog@test_bot"))
+                sent = self.calls("sendMessage")[-1].kwargs
+                self.assertEqual(sent["chat_id"], 42)
+                self.assertEqual(sent["parse_mode"], "HTML")
+                self.assertEqual(sent["link_preview_options"], {"is_disabled": True})
+                text = sent["text"]
+                self.assertIn("Dry run: would ban (no action)", text)
+                self.assertIn("Banned", text)
+                self.assertIn("UTC", text)
+                self.assertIn('href="tg://user?id=8745238344"', text)
+                self.assertIn(
+                    '<a href="tg://user?id=8745238344">测试用户 &lt;b&gt;&amp; Name</a>', text
+                )
+                self.assertNotIn(">8745238344</a>", text)
+                self.assertIn("https://t.me/c/1/26700", text)
+                self.assertIn("Violation: 0.99", text)
+                self.assertIn("Violation: 0.87", text)
+                self.assertNotIn("26702", text)
+                self.assertNotIn("26703", text)
+                self.assertNotIn("private message content", text)
+        self.assertFalse(self.calls("banChatMember") + self.calls("deleteMessage"))
+        lookups = [c for c in self.calls("getChatMember") if c.kwargs["user_id"] == 8745238344]
+        # One lookup per page, even with two entries for this user.
+        self.assertEqual(len(lookups), 2)
+        self.assertNotIn("测试用户", "\n".join(self.store.db.iterdump()))
+
+    async def test_banlog_refresh_uses_current_name_without_last_name(self):
+        self.record_ban()
+        user = {"id": 8745238344, "first_name": "Original name"}
+        self.roles[(-1001, 8745238344)] = {"status": "kicked", "user": user}
+        await self.manager.handle(dm("/start banlog_-1001"))
+        self.assertIn(">Original name</a>", self.calls("sendMessage")[-1].kwargs["text"])
+        user["first_name"] = "Updated name"
+        await self.manager.handle(callback("banlog:-1001:0"))
+        self.assertIn(">Updated name</a>", self.calls("editMessageText")[-1].kwargs["text"])
+
+    async def test_banlog_name_lookup_failure_or_timeout_falls_back_to_id(self):
+        self.record_ban()
+        original = self.telegram.call.side_effect
+        cancelled = asyncio.Event()
+
+        for failure in ("api", "timeout"):
+            with self.subTest(failure=failure):
+
+                async def call(method, failure=failure, **params):
+                    if method == "getChatMember" and params["user_id"] == 8745238344:
+                        if failure == "api":
+                            raise APIError("telegram", 400)
+                        try:
+                            await asyncio.Future()
+                        finally:
+                            cancelled.set()
+                    return await original(method, **params)
+
+                self.telegram.call.side_effect = call
+                with patch("banhammerbot.management.BAN_LOG_NAME_TIMEOUT", 0.01):
+                    await self.manager.handle(dm("/start banlog_-1001"))
+                text = self.calls("sendMessage")[-1].kwargs["text"]
+                self.assertIn('<a href="tg://user?id=8745238344">8745238344</a>', text)
+                self.assertIn("<b>Banned</b>", text)
+        self.assertTrue(cancelled.is_set())
+
+    async def test_banlog_name_lookup_only_resolves_visible_users_concurrently(self):
+        for number in range(1, 7):
+            self.store.record(
+                number,
+                {"chat": {"id": -1001}, "from": {"id": 100 + number}, "message_id": number},
+                "banned",
+            )
+        original = self.telegram.call.side_effect
+        started = set()
+        all_started = asyncio.Event()
+
+        async def call(method, **params):
+            if method == "getChatMember" and 101 <= params["user_id"] <= 106:
+                started.add(params["user_id"])
+                if len(started) == 5:
+                    all_started.set()
+                await all_started.wait()
+                return {"user": {"id": params["user_id"], "first_name": "Visible user"}}
+            return await original(method, **params)
+
+        self.telegram.call.side_effect = call
+        await asyncio.wait_for(self.manager.handle(dm("/start banlog_-1001")), timeout=1)
+        self.assertEqual(started, {102, 103, 104, 105, 106})
+        self.assertEqual(self.calls("sendMessage")[-1].kwargs["text"].count(">Visible user</a>"), 5)
+
+    async def test_banlog_name_lookup_preserves_shutdown_cancellation(self):
+        self.record_ban()
+        original = self.telegram.call.side_effect
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def call(method, **params):
+            if method == "getChatMember" and params["user_id"] == 8745238344:
+                started.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    cancelled.set()
+            return await original(method, **params)
+
+        self.telegram.call.side_effect = call
+        task = asyncio.create_task(self.manager.handle(dm("/start banlog_-1001")))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(self.calls("sendMessage"))
+
+    async def test_banlog_menu_paginates_and_preserves_target_after_group_switch(self):
+        for number in range(1, 8):
+            self.record_ban(number)
+        await self.select()
+        rows = self.calls("sendMessage")[-1].kwargs["reply_markup"]["inline_keyboard"]
+        button = next(
+            button for row in rows for button in row if button["text"] == "Recent ban log"
+        )
+        await self.select(-1002)
+        await self.manager.handle(callback(button["callback_data"]))
+        newest = self.calls("editMessageText")[-1].kwargs
+        self.assertEqual((newest["chat_id"], newest["message_id"]), (42, 10))
+        self.assertIn("First group", newest["text"])
+        self.assertEqual(newest["text"].count("<b>Banned</b>"), 5)
+        self.assertNotIn("/26701", newest["text"])
+        buttons = {
+            b["text"]: b["callback_data"]
+            for r in newest["reply_markup"]["inline_keyboard"]
+            for b in r
+        }
+        self.assertNotIn("Newer", buttons)
+        await self.manager.handle(callback(buttons["Older"]))
+        older = self.calls("editMessageText")[-1].kwargs
+        self.assertEqual(older["text"].count("<b>Banned</b>"), 2)
+        self.assertIn("/26700", older["text"])
+        self.assertIn("/26701", older["text"])
+        self.assertNotIn("/26702", older["text"])
+        buttons = {
+            b["text"]: b["callback_data"]
+            for r in older["reply_markup"]["inline_keyboard"]
+            for b in r
+        }
+        self.assertNotIn("Older", buttons)
+        self.assertIn("Newer", buttons)
+        await self.manager.handle(callback(buttons["Back to menu"]))
+        self.assertIn("Group settings", self.calls("editMessageText")[-1].kwargs["text"])
+        self.assertEqual(self.store.selected_group(42), -1001)
+
+    async def test_banlog_rechecks_admin_permissions_for_command_deep_link_and_pages(self):
+        self.record_ban()
+        await self.select()
+        self.roles[(-1001, 42)] = {"status": "member"}
+        with patch.object(self.store, "recent_bans") as query:
+            for event in (dm("/banlog"), dm("/start banlog_-1001"), callback("banlog:-1001:5")):
+                self.telegram.call.reset_mock()
+                await self.manager.handle(event)
+                query.assert_not_called()
+                self.assertFalse(self.calls("getChat") + self.calls("editMessageText"))
+                self.assertNotIn("8745238344", self.calls("sendMessage")[-1].kwargs["text"])
+
+    async def test_banlog_rejects_other_groups_limited_admins_and_missing_bot_permissions(self):
+        self.record_ban(chat_id=-1002)
+        for role in (
+            {"status": "member"},
+            {"status": "administrator", "can_restrict_members": False},
+        ):
+            self.roles[(-1002, 42)] = role
+            with patch.object(self.store, "recent_bans") as query:
+                await self.manager.handle(callback("banlog:-1002:0"))
+                query.assert_not_called()
+        self.roles[(-1001, 9000)] = {"status": "member"}
+        with patch.object(self.store, "recent_bans") as query:
+            await self.manager.handle(dm("/start banlog_-1001"))
+            query.assert_not_called()
+        self.manager.config = replace(self.config, chat_ids=frozenset({-1001}))
+        with patch.object(self.store, "recent_bans") as query:
+            await self.manager.handle(callback("banlog:-1002:0"))
+            query.assert_not_called()
+
+    async def test_banlog_permission_lookup_failure_does_not_expose_audit(self):
+        self.store.select_group(42, -1001)
+        self.record_ban()
+        original = self.telegram.call.side_effect
+
+        async def call(method, **params):
+            if method == "getChatMember":
+                raise APIError("telegram", 403)
+            return await original(method, **params)
+
+        self.telegram.call.side_effect = call
+        with patch.object(self.store, "recent_bans") as query:
+            with self.assertLogs("banhammerbot.management", level="WARNING"):
+                await self.manager.handle(dm("/banlog"))
+            query.assert_not_called()
+
+    async def test_banlog_deep_link_selects_group_and_escapes_title(self):
+        self.chats[-1001]["title"] = 'Group <b>& "name"'
+        self.record_ban()
+        await self.manager.handle(dm("/start banlog_-1001"))
+        self.assertEqual(self.store.selected_group(42), -1001)
+        text = self.calls("sendMessage")[-1].kwargs["text"]
+        self.assertIn("Group &lt;b&gt;&amp; &quot;name&quot;", text)
+        self.assertIn("<b>Banned</b>", text)
+        self.assertNotIn("Violation:", text)
+
+    async def test_banlog_empty_state_no_selection_and_invalid_requests(self):
+        await self.manager.handle(dm("/banlog"))
+        self.assertIn("Select a group first", self.calls("sendMessage")[-1].kwargs["text"])
+        await self.select()
+        await self.manager.handle(dm("/banlog"))
+        self.assertIn(
+            "No bans or dry-run ban decisions", self.calls("sendMessage")[-1].kwargs["text"]
+        )
+        for event in (dm("/banlog -1002"), callback("banlog:-1001:-5"), callback("banlog:-1001")):
+            with patch.object(self.store, "recent_bans") as query:
+                await self.manager.handle(event)
+                query.assert_not_called()
+        await self.manager.handle(dm("/banlog@different_bot"))
+        self.assertEqual(self.store.selected_group(42), -1001)
+
+    async def test_basic_group_banlog_has_user_link_without_invalid_message_link(self):
+        self.chats[-1001]["type"] = "group"
+        self.record_ban()
+        await self.manager.handle(dm("/start banlog_-1001"))
+        text = self.calls("sendMessage")[-1].kwargs["text"]
+        self.assertIn("tg://user?id=8745238344", text)
+        self.assertIn("Message: 26700", text)
+        self.assertNotIn("https://t.me/c/", text)
 
     async def test_group_deep_link_selects_only_with_permission(self):
         await self.manager.handle(dm("/start group_-1001"))

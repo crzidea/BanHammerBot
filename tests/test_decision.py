@@ -68,7 +68,10 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         config = Config("123:secret", "jev-secret", frozenset({-1001}))
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             decision = await Jev(client, config).decide(
-                {"sender": {"first_name": "Deals"}, "current_message": {"text": "Buy now"}},
+                {
+                    "sender": {"first_name": "Deals", "bio": "Find discounts at spam.example"},
+                    "current_message": {"text": "Buy now"},
+                },
                 {
                     "sender_avatar": ImageAsset("jpg", b"image"),
                     "current_message_image": ImageAsset("png", b"other image"),
@@ -80,6 +83,9 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.headers["Authorization"], "Bearer jev-secret")
         self.assertEqual(request.headers["TypeSafe-Danger-Zone-Images"], "true")
         self.assertEqual(len(body["assets"]), 2)
+        self.assertEqual(
+            body["state"]["user_evidence"]["sender"]["bio"], "Find discounts at spam.example"
+        )
         for label in ("sender_avatar", "current_message_image"):
             reference = body["state"]["images"][label]
             self.assertEqual(body["assets"][reference]["type"], "image")

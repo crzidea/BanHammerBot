@@ -11,6 +11,16 @@ class GroupSettings:
     join_mute_duration: int = 14400
 
 
+@dataclass(frozen=True)
+class BanLogEntry:
+    update_id: int
+    created_at: str
+    user_id: int
+    message_id: int
+    action: str
+    decision: dict | None
+
+
 class Store:
     """Persist settings, group directory, selections, and audits; never message/image content."""
 
@@ -31,6 +41,9 @@ class Store:
                 decision TEXT,
                 detail TEXT
             );
+            CREATE INDEX IF NOT EXISTS audit_ban_log
+                ON audit (chat_id, created_at DESC, update_id DESC)
+                WHERE action IN ('banned', 'would_ban');
             CREATE TABLE IF NOT EXISTS groups (
                 chat_id INTEGER PRIMARY KEY, title TEXT NOT NULL, type TEXT NOT NULL
             );
@@ -161,6 +174,31 @@ class Store:
     def completed(self, update_id: int) -> bool:
         row = self.db.execute("SELECT action FROM audit WHERE update_id=?", (update_id,)).fetchone()
         return row is not None and row[0] != "ban_pending"
+
+    def recent_bans(self, chat_id: int, offset: int = 0, limit: int = 6) -> list[BanLogEntry]:
+        rows = self.db.execute(
+            "SELECT update_id, created_at, user_id, message_id, action, decision FROM audit "
+            "WHERE chat_id=? AND action IN ('banned', 'would_ban') "
+            "ORDER BY created_at DESC, update_id DESC LIMIT ? OFFSET ?",
+            (chat_id, limit, offset),
+        )
+        entries = []
+        for update_id, created_at, user_id, message_id, action, raw_decision in rows:
+            try:
+                decision = json.loads(raw_decision) if raw_decision else None
+            except (ValueError, TypeError):
+                decision = None
+            entries.append(
+                BanLogEntry(
+                    update_id,
+                    created_at,
+                    user_id,
+                    message_id,
+                    action,
+                    decision if isinstance(decision, dict) else None,
+                )
+            )
+        return entries
 
     def record(
         self,
