@@ -19,6 +19,7 @@ class BanLogEntry:
     message_id: int
     action: str
     decision: dict | None
+    user_name: str | None
 
 
 class Store:
@@ -39,7 +40,8 @@ class Store:
                 message_id INTEGER NOT NULL,
                 action TEXT NOT NULL,
                 decision TEXT,
-                detail TEXT
+                detail TEXT,
+                user_name TEXT
             );
             CREATE INDEX IF NOT EXISTS audit_ban_log
                 ON audit (chat_id, created_at DESC, update_id DESC)
@@ -66,6 +68,10 @@ class Store:
             INSERT OR IGNORE INTO groups (chat_id, title, type)
                 SELECT DISTINCT chat_id, CAST(chat_id AS TEXT), 'unknown' FROM audit;
         """)
+        audit_columns = {row[1] for row in self.db.execute("PRAGMA table_info(audit)")}
+        if "user_name" not in audit_columns:
+            with self.db:
+                self.db.execute("ALTER TABLE audit ADD COLUMN user_name TEXT")
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(group_settings)")}
         if "join_mute_duration" not in columns:
             with self.db:
@@ -177,13 +183,14 @@ class Store:
 
     def recent_bans(self, chat_id: int, offset: int = 0, limit: int = 6) -> list[BanLogEntry]:
         rows = self.db.execute(
-            "SELECT update_id, created_at, user_id, message_id, action, decision FROM audit "
+            "SELECT update_id, created_at, user_id, message_id, action, decision, user_name "
+            "FROM audit "
             "WHERE chat_id=? AND action IN ('banned', 'would_ban') "
             "ORDER BY created_at DESC, update_id DESC LIMIT ? OFFSET ?",
             (chat_id, limit, offset),
         )
         entries = []
-        for update_id, created_at, user_id, message_id, action, raw_decision in rows:
+        for update_id, created_at, user_id, message_id, action, raw_decision, user_name in rows:
             try:
                 decision = json.loads(raw_decision) if raw_decision else None
             except (ValueError, TypeError):
@@ -196,6 +203,7 @@ class Store:
                     message_id,
                     action,
                     decision if isinstance(decision, dict) else None,
+                    user_name,
                 )
             )
         return entries
@@ -208,13 +216,20 @@ class Store:
         decision: dict | None = None,
         detail: str | None = None,
     ) -> None:
+        user_name = None
+        if action in {"ban_pending", "banned", "would_ban"}:
+            parts = [message["from"].get(key) for key in ("first_name", "last_name")]
+            name = " ".join(part for part in parts if isinstance(part, str))
+            user_name = " ".join(name.split())[:128] or None
         with self.db:
             self.db.execute(
                 """INSERT INTO audit
-                       (update_id, chat_id, user_id, message_id, action, decision, detail)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                       (update_id, chat_id, user_id, message_id, action,
+                        decision, detail, user_name)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(update_id) DO UPDATE SET action=excluded.action,
-                       decision=excluded.decision, detail=excluded.detail""",
+                       decision=excluded.decision, detail=excluded.detail,
+                       user_name=COALESCE(audit.user_name, excluded.user_name)""",
                 (
                     update_id,
                     message["chat"]["id"],
@@ -223,6 +238,7 @@ class Store:
                     action,
                     json.dumps(decision) if decision else None,
                     detail,
+                    user_name,
                 ),
             )
 

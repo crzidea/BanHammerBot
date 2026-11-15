@@ -176,9 +176,11 @@ of earlier messages, not their image bytes. Missing or inaccessible avatars are 
 
 SQLite stores the group directory (IDs, titles, types), per-group settings, each manager's selected
 group, join actions, polling cursor, and moderation audit. Audit records and application logs contain
-IDs, decisions, model version, action, and sanitized error metadata; no raw messages, user names, bios,
-or images are persisted. There is no automatic retention policy. Manage retention and access for
-your deployment. Existing databases gain the management tables automatically on startup.
+IDs, decisions, model version, action, and sanitized error metadata. Ban-related audit records also
+save the sender's display name from the triggering message, including dry-run decisions and pending
+bans; application logs do not include names. Raw messages, bios, and images are not persisted.
+There is no automatic retention policy. Manage retention and access for your deployment. Existing
+databases gain the management tables and nullable audit `user_name` column automatically on startup.
 
 ## Docker
 
@@ -234,10 +236,11 @@ browse five entries at a time; **Refresh** returns to the latest entries. Permis
 on every request and page change. Existing audit records are available after upgrading; a query
 index is added automatically at startup.
 
-Names are looked up from Telegram when each page opens, so they reflect current display names,
-not necessarily the name at the time of the decision. Names are not saved in the audit database;
-unavailable names fall back to the numeric user ID. Lookups run concurrently with a three-second
-timeout and are shared by entries for the same user on a page.
+Names are saved with each ban or dry-run decision from the triggering message's sender information.
+The log reads those snapshots from SQLite, so later profile changes do not change historical names.
+Opening or refreshing a page does not look up the logged users on Telegram; current admin and bot
+permissions are still verified. Older records without saved names show the numeric user ID and are
+not backfilled with current names.
 User links are Telegram mentions generated from the saved ID and depend on Telegram's privacy
 settings. Message links are provided for supergroups and may no longer work after deletion.
 The log contains only this bot's recorded decisions; it does not retrieve deleted message content

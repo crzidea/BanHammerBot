@@ -1,4 +1,3 @@
-import asyncio
 import sqlite3
 import tempfile
 import unittest
@@ -376,12 +375,20 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
             {"chat_id": -1001, "user_id": 123, "only_if_banned": True},
         )
 
-    def record_ban(self, number=1, chat_id=-1001, action="banned", decision=None):
+    def record_ban(
+        self,
+        number=1,
+        chat_id=-1001,
+        action="banned",
+        decision=None,
+        first_name=None,
+        last_name=None,
+    ):
         self.store.record(
             number,
             {
                 "chat": {"id": chat_id},
-                "from": {"id": 8745238344},
+                "from": {"id": 8745238344, "first_name": first_name, "last_name": last_name},
                 "message_id": 26699 + number,
                 "text": "private message content",
             },
@@ -390,12 +397,11 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_banlog_shows_bans_and_dry_runs_in_either_mode(self):
-        self.roles[(-1001, 8745238344)] = {
-            "status": "kicked",
-            "user": {"id": 8745238344, "first_name": "测试用户", "last_name": "<b>& Name"},
-        }
-        self.record_ban(1, action="banned", decision={"unsolicited_ad": 0.99, "spam": 0.01})
-        self.record_ban(2, action="would_ban", decision={"unsolicited_ad": 0.02, "spam": 0.87})
+        name = {"first_name": "测试用户", "last_name": "<b>& Name"}
+        self.record_ban(1, action="banned", decision={"unsolicited_ad": 0.99, "spam": 0.01}, **name)
+        self.record_ban(
+            2, action="would_ban", decision={"unsolicited_ad": 0.02, "spam": 0.87}, **name
+        )
         self.record_ban(3, action="allow")
         self.record_ban(4, chat_id=-1002)
         await self.select()
@@ -424,96 +430,43 @@ class ManagementTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("private message content", text)
         self.assertFalse(self.calls("banChatMember") + self.calls("deleteMessage"))
         lookups = [c for c in self.calls("getChatMember") if c.kwargs["user_id"] == 8745238344]
-        # One lookup per page, even with two entries for this user.
-        self.assertEqual(len(lookups), 2)
-        self.assertNotIn("测试用户", "\n".join(self.store.db.iterdump()))
+        self.assertEqual(lookups, [])
+        self.assertEqual(
+            [entry.user_name for entry in self.store.recent_bans(-1001)],
+            ["测试用户 <b>& Name", "测试用户 <b>& Name"],
+        )
 
-    async def test_banlog_refresh_uses_current_name_without_last_name(self):
-        self.record_ban()
-        user = {"id": 8745238344, "first_name": "Original name"}
-        self.roles[(-1001, 8745238344)] = {"status": "kicked", "user": user}
+    async def test_banlog_refresh_uses_saved_names_from_each_decision(self):
+        self.record_ban(first_name="Original name")
         await self.manager.handle(dm("/start banlog_-1001"))
         self.assertIn(">Original name</a>", self.calls("sendMessage")[-1].kwargs["text"])
-        user["first_name"] = "Updated name"
+        self.record_ban(2, first_name="Later name")
+        self.roles[(-1001, 8745238344)] = {
+            "status": "kicked",
+            "user": {"id": 8745238344, "first_name": "Current name"},
+        }
         await self.manager.handle(callback("banlog:-1001:0"))
-        self.assertIn(">Updated name</a>", self.calls("editMessageText")[-1].kwargs["text"])
+        text = self.calls("editMessageText")[-1].kwargs["text"]
+        self.assertIn(">Original name</a>", text)
+        self.assertIn(">Later name</a>", text)
+        self.assertNotIn("Current name", text)
+        self.assertTrue(all(c.kwargs["user_id"] in {42, 9000} for c in self.calls("getChatMember")))
 
-    async def test_banlog_name_lookup_failure_or_timeout_falls_back_to_id(self):
+    async def test_banlog_missing_saved_name_falls_back_to_id_without_lookup(self):
         self.record_ban()
         original = self.telegram.call.side_effect
-        cancelled = asyncio.Event()
-
-        for failure in ("api", "timeout"):
-            with self.subTest(failure=failure):
-
-                async def call(method, failure=failure, **params):
-                    if method == "getChatMember" and params["user_id"] == 8745238344:
-                        if failure == "api":
-                            raise APIError("telegram", 400)
-                        try:
-                            await asyncio.Future()
-                        finally:
-                            cancelled.set()
-                    return await original(method, **params)
-
-                self.telegram.call.side_effect = call
-                with patch("banhammerbot.management.BAN_LOG_NAME_TIMEOUT", 0.01):
-                    await self.manager.handle(dm("/start banlog_-1001"))
-                text = self.calls("sendMessage")[-1].kwargs["text"]
-                self.assertIn('<a href="tg://user?id=8745238344">8745238344</a>', text)
-                self.assertIn("<b>Banned</b>", text)
-        self.assertTrue(cancelled.is_set())
-
-    async def test_banlog_name_lookup_only_resolves_visible_users_concurrently(self):
-        for number in range(1, 7):
-            self.store.record(
-                number,
-                {"chat": {"id": -1001}, "from": {"id": 100 + number}, "message_id": number},
-                "banned",
-            )
-        original = self.telegram.call.side_effect
-        started = set()
-        all_started = asyncio.Event()
-
-        async def call(method, **params):
-            if method == "getChatMember" and 101 <= params["user_id"] <= 106:
-                started.add(params["user_id"])
-                if len(started) == 5:
-                    all_started.set()
-                await all_started.wait()
-                return {"user": {"id": params["user_id"], "first_name": "Visible user"}}
-            return await original(method, **params)
-
-        self.telegram.call.side_effect = call
-        await asyncio.wait_for(self.manager.handle(dm("/start banlog_-1001")), timeout=1)
-        self.assertEqual(started, {102, 103, 104, 105, 106})
-        self.assertEqual(self.calls("sendMessage")[-1].kwargs["text"].count(">Visible user</a>"), 5)
-
-    async def test_banlog_name_lookup_preserves_shutdown_cancellation(self):
-        self.record_ban()
-        original = self.telegram.call.side_effect
-        started = asyncio.Event()
-        cancelled = asyncio.Event()
 
         async def call(method, **params):
             if method == "getChatMember" and params["user_id"] == 8745238344:
-                started.set()
-                try:
-                    await asyncio.Future()
-                finally:
-                    cancelled.set()
+                self.fail("Ban log must not look up the logged user")
             return await original(method, **params)
 
         self.telegram.call.side_effect = call
-        task = asyncio.create_task(self.manager.handle(dm("/start banlog_-1001")))
-        try:
-            await asyncio.wait_for(started.wait(), timeout=1)
-        finally:
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
-        self.assertTrue(cancelled.is_set())
-        self.assertFalse(self.calls("sendMessage"))
+        await self.manager.handle(dm("/start banlog_-1001"))
+        text = self.calls("sendMessage")[-1].kwargs["text"]
+        self.assertIn('<a href="tg://user?id=8745238344">8745238344</a>', text)
+        self.assertIn("<b>Banned</b>", text)
+        self.assertEqual([c.kwargs["user_id"] for c in self.calls("getChatMember")], [42, 9000])
 
     async def test_banlog_menu_paginates_and_preserves_target_after_group_switch(self):
         for number in range(1, 8):

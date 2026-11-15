@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import re
 from html import escape
@@ -11,7 +10,6 @@ from .storage import Store
 log = logging.getLogger(__name__)
 JOIN_MUTE_PRESETS = (4 * 3600, 12 * 3600, 24 * 3600)
 BAN_LOG_PAGE_SIZE = 5
-BAN_LOG_NAME_TIMEOUT = 3
 PRIVATE_COMMANDS = [
     ("start", "Open the management menu"),
     ("menu", "Manage your selected group"),
@@ -244,20 +242,6 @@ class Management:
         )
         await self.send(user_id, text, rows, message_id)
 
-    async def ban_log_user_name(self, chat_id: int, user_id: int) -> str:
-        try:
-            # Names are optional: a slow lookup must not delay the log or moderation indefinitely.
-            async with asyncio.timeout(BAN_LOG_NAME_TIMEOUT):
-                member = await self.telegram.call("getChatMember", chat_id=chat_id, user_id=user_id)
-        except (APIError, TimeoutError):
-            return str(user_id)
-        user = member.get("user", {})
-        if user.get("id") != user_id:
-            return str(user_id)
-        parts = [user.get(key) for key in ("first_name", "last_name")]
-        name = " ".join(part for part in parts if isinstance(part, str))
-        return " ".join(name.split())[:128] or str(user_id)
-
     async def ban_log(
         self,
         user_id: int,
@@ -267,12 +251,6 @@ class Management:
     ) -> None:
         chat_id = chat["id"]
         entries = self.store.recent_bans(chat_id, offset, BAN_LOG_PAGE_SIZE + 1)
-        user_ids = list(dict.fromkeys(entry.user_id for entry in entries[:BAN_LOG_PAGE_SIZE]))
-        # Resolve each visible user once, concurrently, without persisting their profile data.
-        names = await asyncio.gather(
-            *(self.ban_log_user_name(chat_id, target_id) for target_id in user_ids)
-        )
-        user_names = dict(zip(user_ids, names, strict=True))
         sections = [
             f"<b>{escape(str(chat.get('title', chat_id)))}</b>\n"
             "Recent ban log · times in UTC\n"
@@ -283,7 +261,7 @@ class Management:
             text = (
                 f"<b>{outcome}</b> · {escape(entry.created_at)} UTC\n"
                 f'User: <a href="tg://user?id={entry.user_id}">'
-                f"{escape(user_names[entry.user_id])}</a>\n"
+                f"{escape(entry.user_name or str(entry.user_id))}</a>\n"
             )
             message = str(entry.message_id)
             if chat["type"] == "supergroup" and str(chat_id).startswith("-100"):

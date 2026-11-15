@@ -41,6 +41,8 @@ class BanLogStorageTests(unittest.TestCase):
             path = directory + "/old.sqlite3"
             with closing(sqlite3.connect(path)) as db:
                 db.executescript("""
+                    CREATE TABLE cursor (id INTEGER PRIMARY KEY, offset INTEGER);
+                    INSERT INTO cursor VALUES (1, 27);
                     CREATE TABLE audit (
                         update_id INTEGER PRIMARY KEY,
                         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -57,6 +59,67 @@ class BanLogStorageTests(unittest.TestCase):
                     self.assertEqual([entry.action for entry in entries], ["banned", "would_ban"])
                     self.assertEqual([entry.user_id for entry in entries], [43, 42])
                     self.assertEqual([entry.message_id for entry in entries], [10, 9])
+                    self.assertEqual([entry.user_name for entry in entries], [None, None])
+                    self.assertEqual(store.offset(), 27)
+
+    def test_names_are_snapshots_for_each_ban_and_dry_run_and_survive_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = directory + "/state.sqlite3"
+            message = {
+                "chat": {"id": -1001},
+                "from": {"id": 42, "first_name": "Alice", "last_name": "Example"},
+                "message_id": 9,
+                "text": "PRIVATE MESSAGE",
+            }
+            with closing(Store(path)) as store:
+                store.record(1, message, "banned")
+                message["from"]["first_name"] = "Renamed"
+                store.record(2, message, "would_ban")
+            with closing(Store(path)) as store:
+                entries = store.recent_bans(-1001)
+                self.assertEqual(
+                    [(entry.action, entry.user_name) for entry in entries],
+                    [("would_ban", "Renamed Example"), ("banned", "Alice Example")],
+                )
+                self.assertNotIn("PRIVATE MESSAGE", "\n".join(store.db.iterdump()))
+
+    def test_pending_ban_keeps_original_name_when_finalized_or_retried(self):
+        with closing(Store(":memory:")) as store:
+            message = {
+                "chat": {"id": -1001},
+                "from": {"id": 42, "first_name": "Original name"},
+                "message_id": 9,
+            }
+            store.record(1, message, "ban_pending")
+            message["from"]["first_name"] = "Changed name"
+            store.record(1, message, "banned")
+            del message["from"]["first_name"]
+            store.record(1, message, "banned", detail="delete_code=400")
+            entries = store.recent_bans(-1001)
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].user_name, "Original name")
+            self.assertTrue(store.completed(1))
+
+    def test_name_normalization_and_non_ban_records(self):
+        with closing(Store(":memory:")) as store:
+            message = {
+                "chat": {"id": -1001},
+                "from": {"id": 42, "first_name": "  Alice\n", "last_name": " Example\t"},
+                "message_id": 9,
+            }
+            for update_id, action in enumerate(("allow", "error", "stale", "would_ban"), start=1):
+                store.record(update_id, message, action)
+            self.assertEqual(
+                store.db.execute("SELECT user_name FROM audit ORDER BY update_id").fetchall(),
+                [(None,), (None,), (None,), ("Alice Example",)],
+            )
+            for update_id, user, expected in (
+                (5, {"id": 42}, None),
+                (6, {"id": 42, "first_name": " "}, None),
+                (7, {"id": 42, "first_name": "x" * 1000}, "x" * 128),
+            ):
+                store.record(update_id, {**message, "from": user}, "banned")
+                self.assertEqual(store.recent_bans(-1001, limit=1)[0].user_name, expected)
 
     def test_missing_or_unreadable_old_decision_does_not_hide_ban(self):
         with closing(Store(":memory:")) as store:

@@ -81,6 +81,7 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
     async def test_high_confidence_bans_and_deletes(self):
         await self.bot.handle(update())
         self.assertEqual(self.action(), "banned")
+        self.assertEqual(self.store.recent_bans(-1001)[0].user_name, "Deals")
         self.assertEqual(
             self.calls("banChatMember")[0].kwargs,
             {
@@ -102,6 +103,7 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         self.bot.config = replace(self.config, dry_run=True)
         await self.bot.handle(update())
         self.assertEqual(self.action(), "would_ban")
+        self.assertEqual(self.store.recent_bans(-1001)[0].user_name, "Deals")
         self.assertFalse(self.calls("banChatMember") + self.calls("deleteMessage"))
 
     async def test_per_group_dry_run_overrides_global_default(self):
@@ -166,7 +168,7 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["chat_id"], 42)
         self.assertIn("Dry run: would ban (no action)", sent["text"])
         self.assertIn("Violation: 0.99", sent["text"])
-        self.assertIn('href="tg://user?id=42"', sent["text"])
+        self.assertIn('<a href="tg://user?id=42">Deals</a>', sent["text"])
         self.jev.decide.assert_not_awaited()
         self.assertFalse(self.calls("banChatMember") + self.calls("deleteMessage"))
 
@@ -335,6 +337,7 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         self.delete_error = True
         await self.bot.handle(update())
         self.assertEqual(self.action(), "banned")
+        self.assertEqual(self.store.recent_bans(-1001)[0].user_name, "Deals")
 
     async def test_duplicate_update_is_not_applied_twice(self):
         event = update()
